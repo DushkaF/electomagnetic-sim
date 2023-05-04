@@ -14,21 +14,29 @@ def get_circuit(filename="input.txt"):
     return points
 
 
-def mesh_step_calc(circuit, box, count):
+def mesh_step_calc(circuit, box, centering=True, count=None):
     # TODO for circle
     extremes_raw = []
     for element in circuit:
         extremes_raw.append(element)
     extremes = np.array(extremes_raw)
     boundaries = [[min(extremes[:, i]), max(extremes[:, i])] for i in range(len(extremes[0]))]
-    boundaries = [boundaries[i] if boundaries[i][1] - boundaries[i][0] >= box[i] else [(boundaries[i][1] - boundaries[i][0])/2 - box[i]/2, (boundaries[i][1] - boundaries[i][0])/2 + box[i]/2] for i in range(len(boundaries))]
-    print(boundaries)
+    # print("bound without recalc", boundaries)
+    if centering:
+        boundaries = [boundaries[i] if boundaries[i][1] - boundaries[i][0] >= box[i] else [boundaries[i][0] - (box[i] - abs(boundaries[i][1] - boundaries[i][0]))/2, boundaries[i][1] + (box[i] - abs(boundaries[i][1] - boundaries[i][0]))/2] for i in range(len(boundaries))]
+    else:
+        pass
+        # boundaries = [boundaries[i] if boundaries[i][1] - boundaries[i][0] >= box[i] else [boundaries[i][0] - (box[i] - abs(boundaries[i][1] - boundaries[i][0]))/2, boundaries[i][1] + (box[i] - abs(boundaries[i][1] - boundaries[i][0]))/2] for i in range(len(boundaries))]
+    # print("bound", boundaries)
     ranges = [boundaries[i][1] - boundaries[i][0] for i in range(len(boundaries))]
-    steps = [i / count for i in ranges]
-    if 0 in steps:
-        steps.remove(0)
-    step = min(steps)
-    return step, boundaries
+    if count is not None:
+        steps = [i / count for i in ranges]
+        if 0 in steps:
+            steps.remove(0)
+        step = min(steps)
+        return step, boundaries
+    else:
+        return None, boundaries
 
 
 def get_segments(circuit):
@@ -45,13 +53,10 @@ def generate_mesh(mesh_basis):
     return mesh
 
 
-def mesh_solver(segments, mesh, current, z=None):
+def mesh_solver(segments, mesh, current, verbose=False):
     x_plane = mesh[0]
     y_plane = mesh[1]
-    if z is None:
-        z_plane = mesh[2]
-    else:
-        z_plane = [z]
+    z_plane = mesh[2]
 
 
     solved_vect_mesh = [[[0 for i in range(len(z_plane))] for j in range(len(y_plane))] for k in range(len(x_plane))]
@@ -62,11 +67,12 @@ def mesh_solver(segments, mesh, current, z=None):
             for row in range(len(x_plane)):
                 solved_segments_in_point = []
                 for segment in segments:
-                    solved_point = BSL_solver(segment, [x_plane[row], y_plane[col], z_plane[high]], current)
+                    solved_point = BSL_solver(segment, np.round([x_plane[row], y_plane[col], z_plane[high]], 6), current)
                     solved_segments_in_point.append(solved_point)
                 solved_vect_mesh[col][row][high] = np.nansum(solved_segments_in_point, axis=0)
                 solved_magnitude_mesh[col][row][high] = np.linalg.norm(solved_vect_mesh[col][row][high])
-        print("Solved ", high+1, " slices of ", len(z_plane))
+        if verbose:
+            print("Solved ", high+1, " slices of ", len(z_plane))
     return np.array(solved_vect_mesh), np.array(solved_magnitude_mesh)
 
 
@@ -79,7 +85,9 @@ def point2line_in_space(line, point):
 
 # Biot–Savart law for infinite line
 def BSL_solver(line, point, current):
-    mu_0 = 1.25663706212 * 10 ** (-6)
+    # mu_0 = 1.25663706212 * 10 ** (-6)
+    #todo rename
+    mu_0 = 1
 
     r, s = point2line_in_space(line, point)
 
@@ -90,11 +98,14 @@ def BSL_solver(line, point, current):
 
     cos_a1 = np.dot(A, B) / (np.linalg.norm(A) * np.linalg.norm(B))
     cos_a2 = -np.dot(C, D) / (np.linalg.norm(C) * np.linalg.norm(D))
-    B_scalar = current * mu_0 / (4 * np.pi * r) * np.round((np.nansum(np.array([cos_a1, -cos_a2]))), 10)
+    if np.isnan(np.sum(np.array([cos_a1, -cos_a2]))):
+        B_scalar = np.inf
+    else:
+        B_scalar = current * mu_0 / (4 * np.pi * r) * np.round((np.nansum(np.array([cos_a1, -cos_a2]))), 10)
 
     R = np.cross(A, B)
     R_norm = R / np.linalg.norm(R)
-    B_vector = R_norm * B_scalar
+    B_vector = R_norm * B_scalar if not np.isinf(B_scalar) else np.full(3, np.inf)
 
     return B_vector
 
@@ -106,15 +117,19 @@ def plot_results(circuit, mesh_basis, mesh, value):
     fig, ax = plt.subplots()
     ax.plot(x_circuit, y_circuit, linewidth=2, color='red')
 
-    ax.contour(mesh_basis[0], mesh_basis[1], value, levels=100)
+    max_val = np.max(value[np.isfinite(value)])
+
+    value[np.isinf(value)] = max_val
+
+    ax.contourf(mesh_basis[0], mesh_basis[1], value, levels=10)
+
 
     # ax.scatter(mesh[0], mesh[1],  s=1, color='green')
-
     # for i, txt in enumerate(np.array(value).ravel()):
     #     ax.annotate('{0:.2e}'.format(txt), (mesh[0].ravel()[i], mesh[1].ravel()[i]))
 
     fig.set_figwidth(12)
-    fig.set_figheight(9)
+    fig.set_figheight(12)
     plt.show()
 
 
@@ -152,29 +167,35 @@ def save_data(data):
         file.write(line)
 
 
-def main_func(count, z=None):
+# Flat flag make one layer mesh with height same in z box value
+def main_func(solver_box, mesh_points_count=None, mesh_step=None, flat=True):
+    if mesh_points_count is None and mesh_step is None:
+        raise "Mesh step or mesh points count in not defined!"
+
     circuit = get_circuit("input.txt")
     # current = float(input("Current through the circuit, in amperes: "))
     # mesh_points_count = float(input("Mesh points count, in points per shortest axis: "))
-    solver_box = [1, 1, 1]
     current = 1
-    mesh_points_count = count
-    mesh_step, mesh_boundaries = mesh_step_calc(circuit, solver_box, mesh_points_count)
+    if mesh_step is None:
+        mesh_step, mesh_boundaries = mesh_step_calc(circuit, solver_box, mesh_points_count)
+    else:
+        _, mesh_boundaries = mesh_step_calc(circuit, solver_box)
     print("Mesh step ", mesh_step)
-    mesh_basis = [np.arange(mesh_boundaries[i][0], mesh_boundaries[i][1] + mesh_step, mesh_step) for i in
+    mesh_basis = [np.arange(mesh_boundaries[i][0], mesh_boundaries[i][1] + mesh_step/3, mesh_step) for i in
                   range(len(mesh_boundaries))]
-    # mesh_basis = [i if len(i) > 0 else np.append(i, 0) for i in mesh_basis] # for the existence of at least one element
+    if flat:
+        mesh_basis[2] = [solver_box[2]]
     # print(mesh_basis)
     mesh = generate_mesh(mesh_basis)
     circuit_segments = get_segments(circuit)
-    vect_solve, magnitude_solve = mesh_solver(circuit_segments, mesh_basis, current,z)
+    vect_solve, magnitude_solve = mesh_solver(circuit_segments, mesh_basis, current, verbose=True)
 
-    return circuit, mesh_basis, mesh, magnitude_solve, vect_solve
+    return circuit, mesh_step, mesh_basis, mesh, magnitude_solve, vect_solve
 
 if __name__ == "__main__":
-    circuit, mesh_basis, mesh, magnitude_solve, vect_solve = main_func(50, 0)
+    circuit, mesh_step, mesh_basis, mesh, magnitude_solve, vect_solve = main_func([0.01703*2, 0.01703*2, 0], 0.000525, 21)
 
-    plot_results(circuit, mesh_basis, mesh, magnitude_solve[0])
-    plot_3D(circuit, mesh_basis, mesh, magnitude_solve[0])
+    plot_results(circuit, mesh_basis, mesh, magnitude_solve[:,:,0])
+    # plot_3D(circuit, mesh_basis, mesh, magnitude_solve[:,:,0])
 
     # save_da
